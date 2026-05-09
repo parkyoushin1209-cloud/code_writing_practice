@@ -1,0 +1,174 @@
+
+
+
+class my_driver extends uvm_driver #(apb_transfer);
+`uvm_component_utils(my_driver)
+`uvm_register_cb(my_driver, drv_cb)
+
+virtual apb_if vif;
+apb_transfer req_list[$];
+int max_pipeline_depth = 4;
+semaphore bus_addr_lock, bus_data_lock;
+
+function new(string name, uvm_component parent);
+super.new(name, parent);
+endfunction
+extern virtual function void build_phase(uvm_phase phase);
+extern virtual function void connect_phase(uvm_phase phase);
+extern virtual task run_phase(uvm_phase phase);
+extern virtual protected task get_and_drive();
+extern virtual protected task drive_transfer();
+extern virtual protected task send_to_dut(apb_transfer trans);
+extern virtual protected task reset_addr_signals();
+extern virtual protected task reset_data_signals();
+extern virtual protected task reset_signals();
+endclass : my_driver
+
+
+function void my_driver::build_phase(uvm_phase phase);
+super.build_phase(phase);
+bus_addr_lock = new(1);
+bus_data_lock = new(1);
+endfunction : build_phase
+
+function void my_driver::connect_phase(uvm_phase phase);
+super.connect_phase(phase);
+if(!uvm_config_db #(virtual apb_if)::get(this, get_full_name(), "vif", vif)) // get_full_name() 대신 ""사용도 많이 씀
+`uvm_error("NOVIF", {"virtual interface must be set for", get_full_name(), ".vif"})
+endfunction : connect_phase
+
+task my_driver::run_phase();
+fork
+  get_and_drive();
+  drive_transfer();
+  reset_signals();
+join
+endtask : run_phase
+
+task my_driver::get_and_drive(); //시퀀서-드라이버
+forever begin 
+while(req_list.size() <= max_pipeline_depth) begin
+seq_item_port.get_next_item(req);
+$cast(rsp, req);
+rsp.set_id_info(req);
+req_list.push_back(rsp);
+seq_item_port.item_done(rsp);
+end
+end
+endtask : get_and_drive
+
+task my_driver::drive_transfer();
+forever begin
+apb_transfer cur_req;
+wait(req_list.size() > 0);
+cur_req = req_list.pop_front();
+
+fork
+  automatic apb_transfer simple_trans = cur_req;
+  `uvm_do_callbacks(my_driver, drv_cb, pre_tx(simple_trans)) //콜백도 같은 객체 기준으로
+  send_to_dut(simple_trans);
+  `uvm_do_callbacks(my_driver, drv_cb, post_tx(simple_trans))
+  rsp_port.write(simple_trans);
+join_none
+end
+endtask
+
+//1번 일반적인 전송
+task my_driver::send_to_dut(apb_transfer trans);
+bus_data_lock.get(1);
+@(vif.cb);
+vif.cb.addr <= trans.addr;
+vif.cb.data <= trans.data;
+vif.cb.write <= trans.write_en;
+vif.cb.valid <= 1'b1; 
+
+do begin
+  @(vif.clk);
+end while(vif.ready != 1);
+
+reset_signals();
+bus_data_lock.put(1);
+endtask
+
+//2번 페이즈 병렬화 => 이 경우 주소용 세마포, 데이터용 세마포 개별적으로 이용
+task my_driver::send_to_dut(apb_transfer trans); 
+// 두개의 phase를 한 태스크에 둘 경우 레이스 컨디션 위험 존재 => 1. 각 페이즈 별로 reset을 진행하거나
+//2. 주소부, 데이터부 태스크를 각각 만들고 상위에서 fork 스레드로 제어 run_phase에서는 하나의 트랜잭션을 꺼내도록 drive_transfer()  호출
+//drive_transfer()에서 트랜잭션 꺼내고 fork join으로 2개의 태스크 호출
+fork
+  begin
+    bus_addr_lock.get(1);
+    @(vif.cb);
+    vif.cb.addr <= trans.addr;
+    vif.cb.addr_valid <= 1'b1;
+    @(vif.cb);
+    vif.cb.addr_valid <= 1'b0;
+    reset_addr_signals();
+    bus_addr_lock.put(1);
+  end
+
+  begin
+    bus_data_lock.get(1);
+    repeat(2) @(vif.cb);
+    vif.cb.data <= trans.data;
+    vif.cb.data_valid <= 1'b1;
+    wait(vif.cb.ready == 1);
+    vif.cb.data_valid <= 1'b0;
+    reset_data_signals();
+    bus_data_lock.put(1);
+  end
+join
+
+`uvm_info("DRV", "Address and Data phases completed", UVM_HIGH)
+endtask
+
+task my_driver::reset_data_signals(); // 보통 내부에 1클럭 정도의 여유를 두어 put. get을 명확히 구분되게 함
+vif.cb.data <= '0;
+vif.cb.data_valid <= 1'b0;
+@(vif.cb);
+endtask
+
+task my_driver::reset_addr_signals();
+vif.cb.addr <= 0;
+vif.cb.addr_valid <= 1'b0;
+@(vif.cb);
+endtask
+
+task my_driver::reset_signals();
+vif.cb.addr <= 0;
+vif.cb.addr_valid <= 1'b0;
+vif.cb.data <= '0;
+vif.cb.data_valid <= 1'b0;
+@(vif.cb);
+endtask
+
+
+
+
+핵심
+1. get에서 get_full_name() 대신 " " 사용도 가능함
+2. 트랜잭션을 여러 개 보내고 싶을 경우 세마포를 이용해 인터페이스 신호 오염 방지
+3. 클럭킹 블록을 이용해 dut와 TB 사이 레이스 컨디션 줄여주기(클럭킹 블록은 샘플링, 드라이빙 시 스큐를 제공해줌)
+4. 페이즈 병렬화 시 데이터부 제어부 사이 신호 소유권을 명확히 하기
+=> a. 태스크를 따로 주거나(이 경우 트랜잭션을 공통으로 받기 위해 run - drive_transfer-addr/data)로 구분해줌
+=> b. 리셋 메서드를 따로따로 만들기
+5. 신호 초기화 시 z보다는 0으로 바꿀 것을 추천함
+6. send_to_dut를 전후로 세마포 get, put 실행(put은 리셋 메서드 이후에)
+7, `uvm_do_callbacks 사용 시 메서드 인자는 공통되게 설정
+8. 트랜잭션 여러 개 보낼거면 set_id_info, automatic 등을 사용
+9. fork/join_none 사용시 스레드 수명 주의
+부모 태스크가 먼저 끝나서 지역 변수 수명, 트랜잭션 핸들 공유, dangling 프로세스 문제 발생 가능
+=> automatic, transaction clone/copy, wait fork등 고려 필요
+10 queue 접근도 서로 다른 스레드가 push, pop 접근(producer-consumer 구조)
+=> 메일박스, tlm_fifo, 세마포 보호를 더 많이 사용함 => UVM의 경우 uvm_tlm_anaysis_fifo, uvm_tlm_fifo를 많이 사용함
+11. wait(req_list.size() > 0) busy-wait 가능성 => 
+단순하나 이벤트 구동 동기화보다 비효율적일 수 있음 -> event, 메일박스 블로킹 get, fifo get 방식이 더 깔끔함
+12. APB protocol timing 명확화
+APB는 보통 셋업, 인에이블 페이즈 2사이클 구조 => 파이프라인 구조를 만들어도 addr valid timing, ready sampling timing을 프로토콜 spec 기준으로 맞추는 게 중요 => addr phase, data phase를 분리 했어도 타이밍 바이올레이션 유무 확인
+13. 콜백은 기능 삽입용 훅(pre_tx : 전송 전 수정/검사, post_tx: 후처리/커버리지/에러 주입)
+14. 클로킹 블럭 사용시 cb를 거쳐서 접근 ~~~~.cb.~~
+15 신호 cleanup, 프로토콜 completion은 다름(handshake 완료 != signal reset 완료)
+=> cleanup 이후 unlock, transction done 처리가 안전
+16. 세마포 갯수 = 소유권 단위
+addr/data 독립 파이프라인 가능 -> 세마포 분리, 전체 bus atomic access 필요 -> 세마포 1개
+17. 리셋 태스크 내부 wait 위치 조심 => 마지막에 @(clk)로 한 번 대기하게 하기  => 다음 get과 현재 put이 겹쳐버리지 않게
