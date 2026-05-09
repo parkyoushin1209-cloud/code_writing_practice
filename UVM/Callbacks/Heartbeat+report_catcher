@@ -1,0 +1,122 @@
+package my_report_pkg;
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+
+class my_catcher extends uvm_report_catcher;
+
+virtual function action_e catch();
+  if((get_severity() == UVM_ERROR || get_severity() == UVM_FATAL) && (get_id() == "MYID" || get_id() == "HBFAIL")) begin // HBFAIL은 UVM에서 자동 생성되는 고유 id임
+    set_severity(UVM_INFO);
+end
+return THROW;
+endfunction : catch
+endclass : my_catcher
+endpackage : my_report_pkg
+
+
+
+
+module test;
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+import my_report_pkg::*;
+  
+uvm_callbacks_objection hb_obj = new("hb_obj");
+
+
+class child_component extends uvm_component;
+int num_hb;
+
+`uvm_component_utils_begin(child_component)
+`uvm_field_int(num_hb, UVM_DEFAULT)
+`uvm_component_utils_end
+
+function new(string name, uvm_component parent);
+super.new(name, parent);
+endfunction : new
+
+  task run_phase(uvm_phase phase);
+`uvm_info("HBS", $sformatf("#### NUM HB: %d", num_hb), UVM_LOW)
+for(int i= 0; i< num_hb; i++) begin
+    #90 hb_obj.raise_objection(this);
+    #10 hb_obj.drop_objection(this);
+end
+endtask : run_phase
+
+endclass : child_component
+
+class parent_component extends uvm_agent;
+child_component child_0, child_1, child_2;
+
+`uvm_component_utils(parent_component);
+
+function new(string name, uvm_component parent);
+super.new(name, parent);
+endfunction : new
+
+function void build_phase(uvm_phase phase);
+super.build_phase(phase);
+child_0 = child_component::type_id::create("child_0", this);
+child_1 = child_component::type_id::create("child_1", this);
+child_2 = child_component::type_id::create("child_2", this);
+endfunction : build_phase
+
+endclass : parent_component
+
+class simple_test extends uvm_test;
+
+parent_component parent_0;
+uvm_heartbeat my_heartbeat;
+uvm_event hb_e;
+my_catcher catcher = new();
+
+`uvm_component_utils(simple_test)
+
+function new(string name, uvm_component parent);
+super.new(name, parent);
+endfunction : new
+
+function void build_phase(uvm_phase phase);
+super.build_phase(phase);
+parent_0 = parent_component::type_id::create("parent_0", this);
+uvm_config_int::set(this, "parent_0.child_0", "num_hb", 3);
+uvm_config_int::set(this, "parent_0.child_1", "num_hb", 5);
+uvm_config_int::set(this, "parent_0.child_2", "num_hb", 2);
+  my_heartbeat = new("my_heartbeat", this, hb_obj);
+hb_e = new("hb_e");
+  uvm_report_cb::add(null, catcher); // 또는 parent_0만 등록해도 child로 전파됨
+endfunction : build_phase
+
+function void connect_phase(uvm_phase phase);
+uvm_component hb_l[$];
+super.connect_phase(phase);
+void'(my_heartbeat.set_mode(UVM_ANY_ACTIVE));
+my_heartbeat.set_heartbeat(hb_e, hb_l);
+my_heartbeat.add(parent_0.child_0);
+my_heartbeat.add(parent_0.child_1);
+my_heartbeat.add(parent_0.child_2);
+endfunction : connect_phase
+
+task run_phase(uvm_phase phase);
+this.print();
+phase.raise_objection(this, "Raising in the test");
+  repeat(10) #50 hb_e.trigger;
+phase.drop_objection(this, "Dropping in the test");
+endtask : run_phase
+
+virtual function void phase_ready_to_end(uvm_phase phase);
+if(phase.get_name() == "run") begin
+    uvm_objection obj = phase.get_objection();
+
+
+if(phase != null) begin
+    obj.set_drain_time(this, 100ns);
+    `uvm_info("END_PHASE", "All objections dropped. Starting ", UVM_LOW)
+end
+end
+endfunction : phase_ready_to_end
+
+endclass : simple_test
+
+initial run_test("simple_test");
+endmodule : test
